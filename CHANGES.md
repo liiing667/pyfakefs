@@ -23,6 +23,12 @@ The released versions correspond to PyPI releases.
 * fixed `os.rename` failing for the root user in a directory owned by
   another user
   (see [#1341](https://github.com/pytest-dev/pyfakefs/issues/1341))
+* `os.scandir` now snapshots the directory when the iteration starts, so
+  entries added or removed during iteration do not affect the results;
+  `DirEntry.is_dir()`, `DirEntry.is_file()` and `DirEntry.stat()` are
+  cached like in the real file system, and the snapshot is released when
+  the iterator gets closed or exhausted. `os.walk` (and, on Python 3.12+,
+  `pathlib.Path.walk()`) now uses the same snapshot semantics
 
 ## [Version 6.2.0](https://pypi.python.org/pypi/pyfakefs/6.2.0) (2026-04-12)
 

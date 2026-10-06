@@ -1130,6 +1130,59 @@ class FakePathlibPathFileOperationTest(RealPathlibTestCase):
             [self.path(self.make_path("foo", "setup.py"))],
         )
 
+    @unittest.skipIf(sys.version_info < (3, 12), "Path.walk new in Python 3.12")
+    def test_walk(self):
+        self.create_file(self.make_path("foo", "bar", "1.txt"))
+        self.create_file(self.make_path("foo", "2.txt"))
+        path = self.path(self.make_path("foo"))
+        result = [
+            (str(dir_path), sorted(dirnames), sorted(filenames))
+            for dir_path, dirnames, filenames in path.walk()
+        ]
+        self.assertEqual(
+            [
+                (self.make_path("foo"), ["bar"], ["2.txt"]),
+                (self.make_path("foo", "bar"), [], ["1.txt"]),
+            ],
+            sorted(result),
+        )
+
+    @unittest.skipIf(
+        sys.version_info < (3, 13),
+        "symlinks to directories are walked as files since Python 3.13",
+    )
+    def test_walk_symlinks_to_directories_as_files(self):
+        skip_if_symlink_not_supported()
+        self.create_dir(self.make_path("foo", "bar"))
+        self.create_file(self.make_path("foo", "bar", "1.txt"))
+        self.create_symlink(self.make_path("foo", "link"), self.make_path("foo", "bar"))
+        path = self.path(self.make_path("foo"))
+        result = [
+            (str(dir_path), sorted(dirnames), sorted(filenames))
+            for dir_path, dirnames, filenames in path.walk()
+        ]
+        # with follow_symlinks=False (the default), the symlink to a
+        # directory is listed as a file and is not recursed into
+        self.assertEqual(
+            [
+                (self.make_path("foo"), ["bar"], ["link"]),
+                (self.make_path("foo", "bar"), [], ["1.txt"]),
+            ],
+            sorted(result),
+        )
+        result = [
+            (str(dir_path), sorted(dirnames), sorted(filenames))
+            for dir_path, dirnames, filenames in path.walk(follow_symlinks=True)
+        ]
+        self.assertEqual(
+            [
+                (self.make_path("foo"), ["bar", "link"], []),
+                (self.make_path("foo", "bar"), [], ["1.txt"]),
+                (self.make_path("foo", "link"), [], ["1.txt"]),
+            ],
+            sorted(result),
+        )
+
 
 class RealPathlibPathFileOperationTest(FakePathlibPathFileOperationTest):
     def use_real_fs(self):

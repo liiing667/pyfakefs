@@ -5449,6 +5449,150 @@ class FakeScandirTest(FakeOsModuleTestBase):
         assert not self.os.path.exists(file1_path)
         assert not self.os.path.exists(file2_path)
 
+    def test_entries_added_during_iteration_are_not_listed(self):
+        dir_path = self.make_path("snap_add")
+        for name in ("file1", "file2", "file3"):
+            self.create_file(self.os.path.join(dir_path, name))
+        seen = []
+        with self.os.scandir(dir_path) as it:
+            for entry in it:
+                seen.append(entry.name)
+                if len(seen) == 1:
+                    self.create_file(self.os.path.join(dir_path, "file4"))
+        self.assertEqual(["file1", "file2", "file3"], sorted(seen))
+
+    def test_entries_removed_during_iteration_are_still_listed(self):
+        dir_path = self.make_path("snap_remove")
+        for name in ("file1", "file2", "file3"):
+            self.create_file(self.os.path.join(dir_path, name))
+        with self.os.scandir(dir_path) as it:
+            iterator = iter(it)
+            first = next(iterator)
+            for name in ("file1", "file2", "file3"):
+                file_path = self.os.path.join(dir_path, name)
+                if self.os.path.exists(file_path):
+                    self.os.remove(file_path)
+            rest = [entry.name for entry in iterator]
+        self.assertEqual(["file1", "file2", "file3"], sorted([first.name] + rest))
+
+    def test_iteration_is_not_repeated_after_exhaustion(self):
+        dir_path = self.make_path("no_rescan")
+        self.create_file(self.os.path.join(dir_path, "file"))
+        with self.os.scandir(dir_path) as it:
+            self.assertEqual(["file"], [entry.name for entry in it])
+            # a new iterator pass does not rescan the directory
+            self.assertEqual([], [entry.name for entry in it])
+            self.assertRaises(StopIteration, next, it)
+
+    def test_dir_entry_stat_is_cached(self):
+        dir_path = self.make_path("stat_cache")
+        file_path = self.os.path.join(dir_path, "file")
+        self.create_file(file_path, contents=b"test")
+        with self.os.scandir(dir_path) as it:
+            entry = next(iter(it))
+        stat_result = entry.stat()
+        self.os.remove(file_path)
+        # the cached result is returned even if the file no longer exists
+        self.assertEqual(stat_result, entry.stat())
+        self.assertEqual(stat_result, entry.stat())
+
+    def test_dir_entry_stat_raises_for_removed_entry(self):
+        dir_path = self.make_path("stat_removed")
+        file_path = self.os.path.join(dir_path, "file")
+        self.create_file(file_path)
+        with self.os.scandir(dir_path) as it:
+            entry = next(iter(it))
+        self.os.remove(file_path)
+        with self.assertRaises(FileNotFoundError):
+            entry.stat()
+        with self.assertRaises(FileNotFoundError):
+            entry.stat(follow_symlinks=False)
+
+    def test_dir_entry_lstat_is_cached(self):
+        skip_if_symlink_not_supported()
+        dir_path = self.make_path("lstat_cache")
+        file_path = self.os.path.join(dir_path, "file")
+        link_path = self.os.path.join(dir_path, "link")
+        self.create_file(file_path)
+        self.create_symlink(link_path, file_path)
+        with self.os.scandir(dir_path) as it:
+            entries = {entry.name: entry for entry in it}
+        link_stat = entries["link"].stat(follow_symlinks=False)
+        self.os.remove(link_path)
+        # the cached lstat result is returned for the removed link
+        self.assertEqual(link_stat, entries["link"].stat(follow_symlinks=False))
+        with self.assertRaises(FileNotFoundError):
+            entries["link"].stat()
+
+    def test_dir_entry_is_dir_is_cached(self):
+        dir_path = self.make_path("isdir_cache")
+        sub_path = self.os.path.join(dir_path, "sub")
+        self.create_dir(sub_path)
+        with self.os.scandir(dir_path) as it:
+            entry = next(iter(it))
+        self.os.rmdir(sub_path)
+        # the type is taken from the directory snapshot and does not
+        # change if the entry is removed afterwards
+        self.assertTrue(entry.is_dir())
+        self.assertFalse(entry.is_file())
+        self.assertFalse(entry.is_symlink())
+
+    def test_dir_entry_is_file_is_cached(self):
+        dir_path = self.make_path("isfile_cache")
+        file_path = self.os.path.join(dir_path, "file")
+        self.create_file(file_path)
+        with self.os.scandir(dir_path) as it:
+            entry = next(iter(it))
+        self.os.remove(file_path)
+        self.assertTrue(entry.is_file())
+        self.assertFalse(entry.is_dir())
+
+    def test_snapshot_released_on_close(self):
+        # uses implementation internals, fake fs only
+        self.skip_real_fs()
+        dir_path = self.make_path("release_close")
+        self.create_file(self.os.path.join(dir_path, "file"))
+        it = self.os.scandir(dir_path)
+        next(iter(it))
+        self.assertIsNotNone(it._entries)
+        it.close()
+        self.assertIsNone(it._entries)
+        self.assertRaises(StopIteration, next, it)
+
+    def test_snapshot_released_on_exhaustion(self):
+        # uses implementation internals, fake fs only
+        self.skip_real_fs()
+        dir_path = self.make_path("release_exhausted")
+        self.create_file(self.os.path.join(dir_path, "file"))
+        it = self.os.scandir(dir_path)
+        self.assertEqual(1, len(list(it)))
+        self.assertIsNone(it._entries)
+        self.assertRaises(StopIteration, next, it)
+
+    def test_snapshot_released_on_context_manager_exit(self):
+        # uses implementation internals, fake fs only
+        self.skip_real_fs()
+        dir_path = self.make_path("release_ctx")
+        self.create_file(self.os.path.join(dir_path, "file"))
+        with self.os.scandir(dir_path) as it:
+            next(iter(it))
+            self.assertIsNotNone(it._entries)
+        self.assertIsNone(it._entries)
+        self.assertRaises(StopIteration, next, it)
+
+    def test_scandir_not_a_directory(self):
+        file_path = self.make_path("not_a_dir")
+        self.create_file(file_path)
+        self.assert_raises_os_error(errno.ENOTDIR, self.scandir, file_path)
+
+    def test_scandir_no_read_permission(self):
+        self.check_posix_only()
+        self.skip_root()
+        dir_path = self.make_path("no_perm")
+        self.create_dir(dir_path)
+        self.os.chmod(dir_path, 0o333)
+        self.assert_raises_os_error(errno.EACCES, self.scandir, dir_path)
+
     def check_stat(
         self, absolute_symlink_expected_size, relative_symlink_expected_size
     ):
