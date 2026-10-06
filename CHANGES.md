@@ -10,6 +10,14 @@ The released versions correspond to PyPI releases.
 * some minor macOS-specific behavior changes to match the behavior
   of the current macOS version used in CI
   (see [#1327](https://github.com/pytest-dev/pyfakefs/issues/1327))
+* `os.scandir` now takes a snapshot of the directory entries at creation,
+  so that changes to the directory during the iteration do not affect it;
+  the snapshot is released when the iterator is exhausted or closed
+* `os.DirEntry` now caches `stat`, `is_dir` and `is_file` results like the
+  real implementation, including the behavior for entries removed after
+  the directory has been scanned
+* `os.walk` is now implemented on top of `os.scandir`, matching the real
+  implementation
 
 ### Fixes
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import sys
 import weakref
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import TYPE_CHECKING
 
 from pyfakefs.helpers import IS_PYPY, make_string_path, to_string
@@ -71,7 +72,15 @@ class DirEntry(os.PathLike):
                 ``follow_symlinks`` is set, and this entry points to an existing
                 directory entry.
         """
-        return self._isdir and (follow_symlinks or not self._islink)
+        if follow_symlinks and self._islink:
+            # the type of the link target is not part of the entry snapshot
+            try:
+                return S_ISDIR(self.stat().st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                # the real implementation ignores these errors
+                return False
+        # for non-links, the entry type has been captured in the snapshot
+        return self._isdir
 
     def is_file(self, follow_symlinks=True):
         """Return `True` if this entry is a regular file entry.
@@ -85,7 +94,15 @@ class DirEntry(os.PathLike):
                 ``follow_symlinks`` is set, and this entry points to an existing
                 file entry.
         """
-        return not self._isdir and (follow_symlinks or not self._islink)
+        if follow_symlinks and self._islink:
+            # the type of the link target is not part of the entry snapshot
+            try:
+                return S_ISREG(self.stat().st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                # the real implementation ignores these errors
+                return False
+        # for non-links, the entry type has been captured in the snapshot
+        return not self._isdir and not self._islink
 
     def is_symlink(self):
         """Return `True` if this entry is a symbolic link (even if broken)."""
@@ -97,6 +114,10 @@ class DirEntry(os.PathLike):
         Args:
             follow_symlinks: If `False` and the entry is a symlink, return the
                 result for the symlink, otherwise for the object it points to.
+
+        The result is cached per `follow_symlinks` value, as in the real
+        implementation. If the entry no longer exists and the result has not
+        been cached, `FileNotFoundError` is raised.
         """
         if follow_symlinks:
             if self._statresult_symlink is None:
@@ -130,7 +151,13 @@ class DirEntry(os.PathLike):
 
 class ScanDirIter:
     """Iterator for DirEntry objects returned from `scandir()`
-    function."""
+    function.
+
+    Takes a snapshot of the directory entries at creation, so that entries
+    added to or removed from the directory during the iteration do not
+    affect it. The snapshot is released when the iterator is exhausted or
+    closed.
+    """
 
     def __init__(self, filesystem, path):
         self._filesystem = weakref.ref(filesystem)
@@ -145,7 +172,6 @@ class ScanDirIter:
                 .path  # pytype:disable=attribute-error
             )
             self.path = ""
-            self.entry_iter = iter(())
         else:
             if path is None:
                 path = "."
@@ -153,7 +179,13 @@ class ScanDirIter:
             self.abspath = self.filesystem.absnormpath(path)
             self.path = to_string(path)
         entries = self.filesystem.confirmdir(self.abspath, check_exe_perm=False).entries
-        self.entry_iter = iter(tuple(entries))
+        # snapshot the information the real implementation gets from
+        # `readdir`: the entry names, their types and their inode numbers
+        self._entries = [
+            (name, S_ISDIR(entry.st_mode), S_ISLNK(entry.st_mode), entry.st_ino)
+            for name, entry in entries.items()
+        ]
+        self._pos = 0
 
     @property
     def filesystem(self) -> FakeFilesystem:
@@ -165,13 +197,20 @@ class ScanDirIter:
         return self
 
     def __next__(self):
-        entry = self.entry_iter.__next__()
+        if self._entries is None:
+            raise StopIteration
+        if self._pos >= len(self._entries):
+            self.close()
+            raise StopIteration
+        name, is_dir, is_link, inode = self._entries[self._pos]
+        self._pos += 1
         dir_entry = DirEntry(self.filesystem)
-        dir_entry.name = entry
+        dir_entry.name = name
         dir_entry.path = self.filesystem.joinpaths(self.path, dir_entry.name)
         dir_entry._abspath = self.filesystem.joinpaths(self.abspath, dir_entry.name)
-        dir_entry._isdir = self.filesystem.isdir(dir_entry._abspath)
-        dir_entry._islink = self.filesystem.islink(dir_entry._abspath)
+        dir_entry._isdir = is_dir
+        dir_entry._islink = is_link
+        dir_entry._inode = inode
         return dir_entry
 
     def __enter__(self):
@@ -181,7 +220,8 @@ class ScanDirIter:
         self.close()
 
     def close(self):
-        pass
+        """Release the snapshot of the directory entries."""
+        self._entries = None
 
 
 def scandir(filesystem, path=""):
@@ -200,33 +240,6 @@ def scandir(filesystem, path=""):
         OSError: if the target is not a directory.
     """
     return ScanDirIter(filesystem, path)
-
-
-def _classify_directory_contents(filesystem, root):
-    """Classify contents of a directory as files/directories.
-
-    Args:
-        filesystem: The fake filesystem used for implementation
-        root: (str) Directory to examine.
-
-    Returns:
-        (tuple) A tuple consisting of three values: the directory examined,
-        a list containing all of the directory entries, and a list
-        containing all of the non-directory entries.
-        (This is the same format as returned by the `os.walk` generator.)
-
-    Raises:
-        Nothing on its own, but be ready to catch exceptions generated by
-        underlying mechanisms like `os.listdir`.
-    """
-    dirs = []
-    files = []
-    for entry in filesystem.listdir(root):
-        if filesystem.isdir(filesystem.joinpaths(root, entry)):
-            dirs.append(entry)
-        else:
-            files.append(entry)
-    return root, dirs, files
 
 
 def walk(filesystem, top, topdown=True, onerror=None, followlinks=False):
@@ -252,22 +265,37 @@ def walk(filesystem, top, topdown=True, onerror=None, followlinks=False):
         if not top_most and not followlinks and filesystem.islink(top_dir):
             return
         try:
-            top_contents = _classify_directory_contents(filesystem, top_dir)
+            scandir_it = scandir(filesystem, top_dir)
         except OSError as exc:
-            top_contents = None
             if onerror is not None:
                 onerror(exc)
+            return
 
-        if top_contents is not None:
-            if topdown:
-                yield top_contents
+        dirs = []
+        nondirs = []
+        with scandir_it:
+            for entry in scandir_it:
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    # if the entry cannot be stated, it is treated as
+                    # a non-directory, as in the real implementation
+                    is_dir = False
+                if is_dir:
+                    dirs.append(entry.name)
+                else:
+                    nondirs.append(entry.name)
+        top_contents = (top_dir, dirs, nondirs)
 
-            for directory in top_contents[1]:
-                path = filesystem.joinpaths(top_dir, directory)
-                if not followlinks and filesystem.islink(path):
-                    continue
-                yield from do_walk(path)
-            if not topdown:
-                yield top_contents
+        if topdown:
+            yield top_contents
+
+        for directory in dirs:
+            path = filesystem.joinpaths(top_dir, directory)
+            if not followlinks and filesystem.islink(path):
+                continue
+            yield from do_walk(path)
+        if not topdown:
+            yield top_contents
 
     return do_walk(make_string_path(to_string(top)), top_most=True)

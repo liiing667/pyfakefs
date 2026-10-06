@@ -4765,6 +4765,19 @@ class FakeOsModuleWalkTest(FakeOsModuleTestBase):
             pass
         self.assertTrue(self.get_errno() in (errno.ENOTDIR, errno.ENOENT))
 
+    def test_walk_does_not_rescan_directory(self):
+        """Entries added to a directory after it has been scanned
+        do not show up in the walk results."""
+        base_dir = self.make_path("foo")
+        self.create_file(self.os.path.join(base_dir, "1.txt"))
+        walk_iter = self.os.walk(base_dir)
+        step = next(walk_iter)
+        self.create_file(self.os.path.join(base_dir, "2.txt"))
+        rest = list(walk_iter)
+        self.assertEqual(["1.txt"], step[2])
+        for _, _, files in rest:
+            self.assertNotIn("2.txt", files)
+
     def test_walk_calls_on_error_if_not_directory(self):
         """Calls onerror with correct errno when walking non-directory."""
         self.reset_errno()
@@ -5448,6 +5461,69 @@ class FakeScandirTest(FakeOsModuleTestBase):
                     self.os.remove(entry.path)
         assert not self.os.path.exists(file1_path)
         assert not self.os.path.exists(file2_path)
+
+    def test_scandir_snapshots_entries(self):
+        # entries added to or removed from the directory after the
+        # iteration started do not affect the ongoing iteration
+        self.skip_real_fs()
+        dir_path = self.make_path("snap")
+        self.create_file(self.os.path.join(dir_path, "a.txt"))
+        self.create_dir(self.os.path.join(dir_path, "sub"))
+        dir_iter = self.scandir(dir_path)
+        self.os.remove(self.os.path.join(dir_path, "a.txt"))
+        self.os.rmdir(self.os.path.join(dir_path, "sub"))
+        self.create_file(self.os.path.join(dir_path, "b.txt"))
+        self.assertEqual(
+            ["a.txt", "sub"], sorted(entry.name for entry in dir_iter)
+        )
+        # iterating the same iterator again does not rescan the directory
+        self.assertEqual([], list(dir_iter))
+
+    def test_dir_entry_caches_results(self):
+        # DirEntry caches stat and type information like the real
+        # implementation; cached results survive the removal of the entry,
+        # while non-cached stat calls raise FileNotFoundError
+        self.skip_real_fs()
+        dir_path = self.make_path("cache")
+        file_path = self.os.path.join(dir_path, "file")
+        subdir_path = self.os.path.join(dir_path, "subdir")
+        self.create_file(file_path, contents=b"12345")
+        self.create_dir(subdir_path)
+        entries = {entry.name: entry for entry in self.scandir(dir_path)}
+        file_entry = entries["file"]
+        dir_entry = entries["subdir"]
+        cached_stat = file_entry.stat()
+        self.os.remove(file_path)
+        self.os.rmdir(subdir_path)
+        # cached results are still returned
+        self.assertEqual(5, file_entry.stat().st_size)
+        self.assertIs(cached_stat, file_entry.stat())
+        # type information from the snapshot is still available
+        self.assertTrue(file_entry.is_file(follow_symlinks=False))
+        self.assertFalse(file_entry.is_dir(follow_symlinks=False))
+        self.assertTrue(dir_entry.is_dir(follow_symlinks=False))
+        self.assertFalse(dir_entry.is_file(follow_symlinks=False))
+        # non-cached stat calls behave like the real implementation
+        with self.assertRaises(FileNotFoundError):
+            file_entry.stat(follow_symlinks=False)
+        # is_dir/is_file catch FileNotFoundError like the real implementation
+        self.assertFalse(file_entry.is_dir())
+        self.assertFalse(dir_entry.is_file())
+
+    def test_scandir_close_releases_snapshot(self):
+        # the directory snapshot is released when the iterator is
+        # exhausted or closed, and a closed iterator is exhausted
+        self.skip_real_fs()
+        dir_path = self.make_path("release")
+        self.create_file(self.os.path.join(dir_path, "file"))
+        dir_iter = self.scandir(dir_path)
+        list(dir_iter)
+        self.assertIsNone(dir_iter._entries)
+        with self.scandir(dir_path) as dir_iter:
+            next(dir_iter)
+        self.assertIsNone(dir_iter._entries)
+        with self.assertRaises(StopIteration):
+            next(dir_iter)
 
     def check_stat(
         self, absolute_symlink_expected_size, relative_symlink_expected_size

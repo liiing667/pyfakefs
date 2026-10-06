@@ -1592,6 +1592,22 @@ class FakePathlibUsageInOsFunctionsTest(RealPathlibTestCase):
         assert result[0] == (base_dir, ["bar"], ["1.txt"])
         assert result[1] == (self.os.path.join(base_dir, "bar"), [], ["2.txt"])
 
+    @unittest.skipIf(sys.version_info < (3, 12), "Path.walk is new in Python 3.12")
+    def test_path_walk_uses_snapshot(self):
+        """Path.walk uses the same snapshot semantics as os.scandir:
+        entries added after a directory has been scanned do not show up."""
+        base_dir = self.make_path("foo")
+        base_path = self.path(base_dir)
+        self.create_dir(base_path)
+        self.create_file(base_path / "1.txt")
+        walk_iter = base_path.walk()
+        step = next(walk_iter)
+        self.create_file(base_path / "2.txt")
+        rest = list(walk_iter)
+        assert step[2] == ["1.txt"]
+        for _, _, files in rest:
+            assert "2.txt" not in files
+
 
 class RealPathlibUsageInOsFunctionsTest(FakePathlibUsageInOsFunctionsTest):
     def use_real_fs(self):
